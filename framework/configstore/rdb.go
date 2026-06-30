@@ -2739,6 +2739,48 @@ func (s *RDBConfigStore) UpsertModelParameters(ctx context.Context, params *tabl
 	return nil
 }
 
+const modelParametersUpsertBatchSize = 100
+
+// UpsertModelParametersBatch inserts or updates model parameters in batches.
+// The sync path uses this to avoid one DB round-trip per model parameter row.
+func (s *RDBConfigStore) UpsertModelParametersBatch(ctx context.Context, params []tables.TableModelParameters, tx ...*gorm.DB) error {
+	if len(params) == 0 {
+		return nil
+	}
+	deduped := make([]tables.TableModelParameters, 0, len(params))
+	seen := make(map[string]int, len(params))
+	for _, param := range params {
+		if idx, ok := seen[param.Model]; ok {
+			deduped[idx] = param
+			continue
+		}
+		seen[param.Model] = len(deduped)
+		deduped = append(deduped, param)
+	}
+	var txDB *gorm.DB
+	if len(tx) > 0 {
+		txDB = tx[0]
+	} else {
+		txDB = s.DB()
+	}
+	db := txDB.WithContext(ctx)
+
+	onConflict := clause.OnConflict{
+		Columns:   []clause.Column{{Name: "model"}},
+		UpdateAll: true,
+	}
+	upsert := func(tx *gorm.DB) error {
+		if err := tx.Clauses(onConflict).CreateInBatches(deduped, modelParametersUpsertBatchSize).Error; err != nil {
+			return s.parseGormError(err)
+		}
+		return nil
+	}
+	if len(tx) > 0 {
+		return upsert(db)
+	}
+	return db.Transaction(upsert)
+}
+
 // PLUGINS METHODS
 
 func (s *RDBConfigStore) GetPlugins(ctx context.Context) ([]*tables.TablePlugin, error) {
